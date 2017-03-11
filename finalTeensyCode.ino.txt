@@ -1,0 +1,506 @@
+// this code has been rearranged and commented out in huge swathes, as the gps did not work. 
+
+#include <math.h>
+
+//servos
+#include <Servo.h>
+
+//comms
+#include <Wire.h>
+//#include <i2c_t3.h>
+
+//humidity
+#include <Adafruit_Sensor.h>
+#include <DHT.h>
+#include <DHT_U.h>
+#define DHTPIN            39         // Pin which is connected to the DHT sensor.
+#define DHTTYPE           DHT22     // DHT 22 (AM2302)
+
+DHT_Unified dht(DHTPIN, DHTTYPE);
+uint32_t delayMS;
+
+//gyro
+#include <L3G.h>
+
+//accelerometer
+#include <LSM303.h>
+#include <SFE_BMP180.h>
+
+//GPS
+#include <TinyGPS++.h>
+#include <SoftwareSerial.h>
+
+static const int RXPin = 7, TXPin = 8;
+static const uint32_t GPSBaud = 9600;
+
+TinyGPSPlus gps;
+SoftwareSerial ss(RXPin, TXPin);
+
+//IMU
+L3G gyro;
+LSM303 compass;
+SFE_BMP180 pressure;
+char report[80];
+
+//sd card
+#include <SD.h>
+#include <SPI.h>
+
+//declare servos
+Servo RightServo;
+Servo LeftServo;
+//clock for alt speed
+unsigned long nofloops = 0;
+int backupspd = 0;
+double R = 6371.00;
+
+//declare variables
+bool gpsfailed = true;
+int lastknownlat;
+int lastknownlong;
+int lastknownalt;
+int lastknownlatage;
+int lastknownlongage;
+int lastknownaltage;
+int currentServo = 0;
+double latcan;
+double longcan;
+double latdest;
+double longdest;
+double canspeed;
+double canlatspeed;
+double canlongspeed;
+int canaltspeed;
+double cancourse;
+int altcan; //in dm
+int altdest; //in dm
+int longdist; //in dm
+int latdist; //in dm
+int altdist; //in dm
+int altarray[6] = {0, 0, 0, 0, 0, 0};
+String cantime;
+double altrecord;
+int compassheading;
+int oldcompassheading = 0;
+int oldrvelo;
+int rv = 0;
+double ra = 0;
+float temp;
+float humid;
+String pres;
+unsigned long RVCurrentTime = millis();
+unsigned long RVElapsedTime;
+unsigned long RACurrentTime = millis();
+unsigned long RAElapsedTime;
+unsigned long CurrentTime = millis();
+unsigned long ElapsedTime;
+unsigned long GPSLastSuccess = millis();
+
+void data(String dataToSend) {
+  //pass on through i2c
+  String newstring = String(temp*100) + String(humid*100) + pres + String(longdist) + " " + String(latdist) + " " + String(altdist);
+  Serial.println(newstring.length());
+  Wire.beginTransmission(8);
+  char texts[newstring.length()];
+  dataToSend.toCharArray(texts, newstring.length());
+  Wire.write(texts);
+//  for (int i = 0; i < newstring.length(); i++) {
+//    Wire.write(newstring[i]);
+//  }
+  Wire.endTransmission();
+  //write to SD
+//  Serial.println(dataToSend);
+  File dataFile = SD.open("datalog.txt", FILE_WRITE);
+  dataFile.println(dataToSend);
+  dataFile.close();
+}
+
+void servoPos(int pos) {
+  if ((pos >= -180) && (pos <= 180)) {
+    RightServo.write(90 + (pos/2));
+    LeftServo.write(90 - (pos/2));
+    currentServo = pos;
+  }
+  else if (pos < -180) {
+    RightServo.write(0);
+    LeftServo.write(180);
+    currentServo = -180;
+  }
+  else if (pos > 180) {
+    RightServo.write(180);
+    LeftServo.write(0);
+    currentServo = 180;
+  }
+}
+
+int rotationspeed(int currentheading) {
+  RVElapsedTime = millis() - RVCurrentTime;
+  int changeinheading = (currentheading - oldcompassheading) % 360;
+  if (changeinheading >= 180) {
+    changeinheading -= 360;
+  }
+  int rspd = changeinheading/(RVElapsedTime * 1000);
+  oldcompassheading = currentheading;
+  RVCurrentTime = millis();
+  return(rspd);
+}
+
+double rotationaccel(int currentvelo) {
+  RAElapsedTime = millis() - RACurrentTime;
+  int changeinvelo = (currentvelo - oldrvelo);
+//  if (changeinvelo >= 180) {
+//    changeinvelo -= 360;
+//  }
+  int racc = changeinvelo/(RAElapsedTime * 1000);
+  oldrvelo = currentvelo;
+  RACurrentTime = millis();
+  return(racc);
+}
+
+void changerv(int targetv) {
+  if (rv > targetv) {
+    //if you are spinning too much clockwise, pull more to the right
+    if (!(ra < 0)) {
+      servoPos(currentServo + ((rv - targetv)/180)*30);
+    }
+  }
+  else {
+    if (!(ra > 0)) {
+      servoPos(currentServo - ((targetv - rv)/180)*30);
+    }
+  }
+}
+
+void changeheading(int targeth) {
+  int changeinheading = (targeth - compassheading) % 360;
+  if (changeinheading > 180) {
+    changeinheading -= 360;
+  }
+  if (changeinheading > 0) {
+    if (rv < 0) {
+      changerv(rv + changeinheading/2);
+    }
+  }
+  if (changeinheading < 0) {
+    if (rv > 0) {
+      changerv(rv - changeinheading/2);
+    }
+  }
+}
+
+const int chipSelect = BUILTIN_SDCARD;
+
+void setup() {
+  // put your setup code here, to run once:
+  delay(2000);
+  RightServo.attach(11);
+  LeftServo.attach(12);
+  Serial.begin(19200);
+  Wire.begin();
+  pressure.begin();
+  gyro.enableDefault();
+  compass.init();
+  compass.enableDefault();
+  SD.begin(chipSelect);
+  // Initialize device.
+  dht.begin();
+  delayMS = 1000;
+//  ss.begin(GPSBaud);
+  RightServo.write(90);
+  LeftServo.write(90);
+//  bool notreleased = true;
+//  unsigned long releasetimer = 0;
+//  while (releasetimer < 10000) {
+    compass.read();
+    compassheading = compass.heading();
+//    rv = rotationspeed(compassheading);
+//    ra = rotationaccel(rv);
+//  }
+  RVCurrentTime = millis();
+  RACurrentTime = millis();
+  CurrentTime = millis();
+  GPSLastSuccess = millis();
+  //add setup for old compass heading
+  //add setup for timing variables
+  //setup rotational velocity and acceration
+  //wait for release
+  //hold gps low?
+}
+
+void loop() {
+  // put your main code here, to run repeatedly:
+  // datastring is = "gps time, gps lat, gps long, gps alt, gps speed, gps course, compass, temp, humidity, pressure, long dist, lat dist, alt dist"
+  char status;
+  double T, P, a;
+  String datastring = "";
+//  bool reading = false;
+  //gps
+//  Serial.println("sdfsdfsd");
+//  while (ss.available() > 0) {
+//    gps.encode(ss.read());
+//    if (gps.time.isValid()) {
+//      if (gps.time.isUpdated()) {
+//        reading = true;
+//        cantime = String(gps.time.hour()) + String(gps.time.minute()) + String(gps.time.second());
+//        gpsfailed = false;
+//        /*
+//        datastring += String(gps.time.hour());
+//        datastring += ", "
+//        datastring += String(gps.time.minute());
+//        datastring += ", ";
+//        datastring += String(gps.time.second());
+//        datastring += ", ";
+//        */
+//      }
+//      else {
+//        if (gps.time.age() > 1500) {
+//          gpsfailed = true;
+//          reading = true;
+//        }
+//      }
+//    }
+//    if (gps.location.isValid()) {
+//      if (gps.location.isUpdated()) {
+//        latcan = gps.location.lat();
+//        longcan = gps.location.lng();
+//        gpsfailed = false;
+//        if (!(gps.location.isUpdated())) {
+//          if (gps.location.age() > 2000) {
+//            gpsfailed = true;
+//          }
+//        }
+//        else {
+//          gpsfailed = false;
+//        }
+//      }
+//      else {
+//        gpsfailed = true;
+//      }
+//      }
+//    }
+//    else {
+//      gpsfailed = true;
+//      if ((millis() - GPSLastSuccess) > 1750) {
+//        reading = true;
+//      }
+//    }
+//    if (gps.altitude.isValid()) {
+//      if (gps.altitude.isUpdated()) {
+//        altrecord = gps.altitude.meters();
+//        altcan = altrecord*10; //in dm
+//        gpsfailed = false;
+//      }
+//    }
+//    if (gps.speed.isValid()) {
+//      Serial.println("123d");
+//      if (gps.speed.isUpdated()) {
+////        Serial.println("asdf");
+//        canspeed = gps.speed.mps()*10;
+////        Serial.println(canspeed, 6);
+//        gpsfailed = false;
+//      }
+//    }
+//    if (gps.course.isValid()) {
+//      if (gps.course.isUpdated()) {
+//        cancourse = gps.course.deg();
+//        gpsfailed = false;
+//      }
+//    }
+//  }
+//  if (reading) {
+//    if (gpsfailed) {
+//      datastring += "000000, 0.0, 0.0, 0, 0, 0, ";
+//    }
+//    else {
+//      GPSLastSuccess = millis();
+//      datastring += String(cantime);
+//      datastring += ", ";
+//      datastring += String(latcan, 6);
+//      datastring += ", ";
+//      datastring += String(longcan, 6);
+//      datastring += ", ";
+//      datastring += String(altrecord, 2);
+//      datastring += ", ";
+//      datastring += String(canspeed/10, 3);
+//      datastring += ", ";
+//      datastring += String(cancourse);
+//      datastring += ", ";
+//    }
+//    //Gyro
+//    gyro.read();
+//    datastring += String(gyro.g.x);
+//    datastring += ", ";
+//    datastring += String(gyro.g.y);
+//    datastring += ", ";
+//    datastring += String(gyro.g.z);
+//    datastring += ", ";
+    //compass
+    compass.read();
+    datastring += String(compass.heading());
+    datastring += ", ";
+    compassheading = compass.heading();
+    //temperature
+    sensors_event_t event;
+    dht.temperature().getEvent(&event);
+    if (isnan(event.temperature)) {
+      datastring += "00.00";
+      datastring += ", ";
+    }
+    else {
+      temp = event.temperature;
+      datastring += String(event.temperature);
+      datastring += ", ";
+    }
+    //humidity
+    dht.humidity().getEvent(&event);
+    if (isnan(event.relative_humidity)) {
+      datastring += "00.00";
+      datastring += ", ";
+    }
+    else {
+      humid = event.relative_humidity;
+      datastring += String(event.relative_humidity);
+      datastring += ", ";
+    }
+    //pressure
+    status = pressure.getPressure(P,T);
+    if (status != 0) {
+      pres = String((P+2650), 2);
+      datastring += pres;
+      datastring += ", ";
+    }
+    else {
+      datastring += "00.00";
+      datastring += ", ";
+    }
+    /*
+     * x-axis speed is lat speed
+     * x-axis pos is lat dist
+     * y-axis speed is long speed
+     * y-axis pos is long dist
+     * z-axis speed is alt speed
+     * z-axis pos is alt dist
+     */
+//  
+//    //logitude dist
+//    longdist = gpstokm(latdest, longcan, latdest, longdest)*10000; //in dm
+//    if (longcan < longdest) {
+//      longdist = -longdist;
+//    }
+//    latdist = gpstokm(latcan, longdest, latdest, longdest)*10000; //in dm
+//    if (latcan < latdest) {
+//      latdist = -latdist  ;
+//    }
+//    altdist = (altcan - altdest) * 10; //in dm
+//    //sort speed into vectors
+//    canlatspeed = canspeed * cos(cancourse);
+//    canlongspeed = canspeed * sin(cancourse);
+//    canaltspeed = altspeed(altdist);
+//    datastring += String(longdist);
+//    datastring += ", ";
+//    datastring += String(latdist);
+//    datastring += ", ";
+//    datastring += String(altdist);
+//    datastring += ", ";
+    //measure rotational velocity (rv)
+    rv = rotationspeed(compassheading);
+    ra = rotationaccel(rv);
+    datastring += String(rv);
+    datastring += ", ";
+    datastring += String(ra);
+    //process data
+    data(datastring);
+  }
+  else {
+    compass.read();
+    compassheading = compass.heading();
+    rv = rotationspeed(compassheading);
+    ra = rotationaccel(rv);
+  }
+  // choose steering algorithm
+  if (currenttraj(longdist, latdist, altdist, canlongspeed, canlatspeed, canaltspeed) < 20) {
+    if ((rv > 20) || (rv < -20)) {
+      //keeprv(0);
+    }
+  }
+  if (gpsfailed == false) {
+    
+  }
+  else {
+    
+  }
+}
+
+
+
+//
+//double gpstokm(double lat1, double lng1, double lat2, double lng2) {
+//  //This portion converts the current and destination GPS coords from decDegrees to Radians
+//  double lonR1 = lng1*(PI/180);
+//  double lonR2 = lng2*(PI/180);
+//  double latR1 = lat1*(PI/180);
+//  double latR2 = lat2*(PI/180);
+////This portion calculates the differences for the Radian latitudes and longitudes and saves them to variables
+//  double dlon = lonR2 - lonR1;
+//  double dlat = latR2 - latR1;
+////This portion is the Haversine Formula for distance between two points. Returned value is in KM
+//  double a = (sq(sin(dlat/2))) + cos(latR1) * cos(latR2) * (sq(sin(dlon/2)));
+//  double e = 2 * atan2(sqrt(a), sqrt(1-a));
+//  double d = R * e;
+//  return d;
+//}
+//
+//int altspeed(int alt) {
+//  if (altarray[5] == 0) {
+//    for (int i=0; i<6; i++) {
+//      altarray[i] = alt;
+//    }
+//  }
+//  for (int i = 5; i > 0; i--) {
+//    altarray[i] = altarray[i-1];
+//  }
+//  altarray[0] = alt;
+//  int startalt = (altarray[0] + altarray[1] + altarray[2])/3;
+//  int endalt = (altarray[3] + altarray[4] + altarray[5])/3;
+//  int totaldiff = startalt - endalt;
+//  if ((nofloops % 3) == 0) {
+//    ElapsedTime = millis() - CurrentTime;
+//    int muhsped = (totaldiff / (ElapsedTime*1000)); //dm/s
+//    CurrentTime = millis();
+//    backupspd = muhsped;
+//    return(muhsped);
+//  }
+//  else {
+//    return(backupspd);
+//  }
+//}
+
+void DeathSpiral(String dir) {
+  if (dir == "L") {
+    servoPos(180);
+  }
+  else if (dir == "R") {
+    servoPos(-180);
+  }
+  else {
+    if (currentServo <= 0) {
+      servoPos(180);
+    }
+    else {
+      servoPos(-180);
+    }
+  }
+}
+
+int currenttraj(int x, int y, int z, double xdot, double ydot, int zdot) {
+  double timeuntil = abs(z/zdot);
+  double xdist = x + timeuntil * xdot;
+  double ydist = y + timeuntil * ydot;
+  double distanceline = sqrt(sq(xdist)+sq(ydist));
+  return (distanceline);
+}
+
+
+
+
+
